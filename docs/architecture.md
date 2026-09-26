@@ -2,11 +2,16 @@
 
 ## Overview
 
-RE-MCP is a multi-backend reverse-engineering server that communicates over the Model Context Protocol (MCP). It uses headless APIs — [idalib](https://docs.hex-rays.com/release-notes/9_0#idalib-ida-as-a-library) for IDA Pro, [pyghidra](https://github.com/NationalSecurityAgency/ghidra/tree/master/Ghidra/Features/PyGhidra) for Ghidra — to expose binary analysis capabilities as structured tool calls that LLMs can invoke.
+RE-MCP is a multi-backend reverse-engineering server that communicates over the Model Context Protocol (MCP). It uses [IDA Nexus](https://github.com/HexRaysSA/ida-nexus) for shared GUI/headless IDA databases and [pyghidra](https://github.com/NationalSecurityAgency/ghidra/tree/master/Ghidra/Features/PyGhidra) for headless Ghidra to expose binary analysis capabilities as structured tool calls that LLMs can invoke.
+
+The IDA backend uses **IDA Nexus** for GUI attachment, managed workers, and
+engine-thread dispatch. Its MCP adapters run **in-process**, unlike Ghidra's
+stdio workers. See [IDA Nexus architecture, setup, and compatibility](ida-nexus.md).
+The generic worker/provider terminology below includes both kinds of adapter.
 
 The project is a monorepo with three packages:
 - **`re-mcp-core`** (`packages/re-mcp-core/src/re_mcp/`) — generic MCP supervisor infrastructure (transport, worker management, tool transforms, sandboxed execution)
-- **`re-mcp-ida`** (`packages/re-mcp-ida/src/re_mcp_ida/`) — IDA-specific backend (idalib bootstrap, tools, resources, prompts)
+- **`re-mcp-ida`** (`packages/re-mcp-ida/src/re_mcp_ida/`) — IDA-specific backend (Nexus leases, remote tools, runtime schema discovery, resources, prompts)
 - **`re-mcp-ghidra`** (`packages/re-mcp-ghidra/src/re_mcp_ghidra/`) — Ghidra-specific backend (pyghidra bootstrap, tools, resources, prompts)
 
 The server supports three transport modes:
@@ -40,15 +45,17 @@ For single-database usage, there is one worker. Multiple workers are spawned whe
 
 ## Design Decisions
 
-### Why headless APIs over GUI plugins?
+### Engine integration
 
-Both idalib and pyghidra run their respective analysis engines as libraries within a normal Python process — no GUI, no X11/display dependencies. This has several advantages:
+Nexus supports GUI attachment as well as headless IDA. Both its idalib worker and
+pyghidra can run their analysis engines without a GUI or display dependencies.
+Headless operation has several advantages:
 
 - Process lifecycle is controlled by the server, not the GUI
 - Direct function calls instead of script injection
 - Runs on headless machines (CI, SSH, containers)
 
-The trade-off is that both backends are **thread-affine**: all API calls must happen on the same thread that initialized the engine (the `idapro` import for idalib, the JVM start for pyghidra). Each worker process handles a single database; the supervisor routes requests to the correct worker via stdio pipes.
+Both engines are **thread-affine**. Ghidra uses a main-thread executor inside each stdio worker. IDA Nexus owns that boundary: an in-process MCP adapter holds a `DatabaseHandle` lease and dispatches existing tool implementations through `RemoteModule` into the owning GUI or headless interpreter. The adapter never initializes idalib.
 
 ### Why FastMCP?
 
@@ -83,33 +90,31 @@ Backends are discovered via `re_mcp.backends` entry points, allowing new backend
 
 ### Main-thread execution
 
-Both backends are thread-affine: all engine API calls must happen on the main OS thread. The MCP event loop runs on a background thread (a Python thread with `daemon=True`, not to be confused with the persistent HTTP daemon), while the main thread runs a `MainThreadExecutor` work queue.
+For IDA, Nexus dispatches `nexus_runtime.invoke` on the engine thread. Existing
+sync functions and async pagination helpers execute there, and model arguments
+are validated before invocation. Blocking Nexus HTTP calls run off the MCP event
+loop, serialized per adapter; cancellation cancels and drains the active RPC.
 
-Each backend's `Server` subclass (`IDAServer`, `GhidraServer`) wraps every sync tool and resource function registered via `@mcp.tool()` or `@mcp.resource()` into an `async def` that dispatches the call to the main thread via `call_ida` / `call_ghidra` (both aliases for `dispatch_to_main`, backed by `MainThreadExecutor`). FastMCP sees an async function and skips its own threadpool, so all engine API calls land on the main thread while the MCP server remains responsive. Async tool functions run on the event-loop thread and must use the dispatch function for individual engine API calls.
+The following executor architecture applies to Ghidra. Both engines are thread-affine: all engine API calls must happen on the main OS thread. The MCP event loop runs on a background thread (a Python thread with `daemon=True`, not to be confused with the persistent HTTP daemon), while the main thread runs a `MainThreadExecutor` work queue.
+
+`GhidraServer` wraps every sync tool and resource function registered via `@mcp.tool()` or `@mcp.resource()` into an `async def` that dispatches the call to the main thread via `call_ghidra` (`dispatch_to_main`, backed by `MainThreadExecutor`). FastMCP sees an async function and skips its own threadpool, so all engine API calls land on the main thread while the MCP server remains responsive. Async tool functions run on the event-loop thread and must use the dispatch function for individual engine API calls.
 
 **IDA-specific:** Functions in `re_mcp_ida.helpers` that contain IDA API calls are marked with `@ida_dispatch`. This decorator tags the function with a `_ida_dispatch` attribute (it does not alter execution) and signals that the function must be invoked via `call_ida` from async code. A pre-commit lint script (`scripts/lint_ida_threading.py`) enforces this: it checks that `@ida_dispatch`-marked functions are not called directly from async functions without going through `call_ida`.
 
 ### Engine bootstrap
 
-Each backend provides a `bootstrap()` function (in `<backend>.__init__`) that initializes the analysis engine before any engine-specific imports. Only worker processes call `bootstrap()` — the supervisor never does.
+Ghidra's worker calls `bootstrap()` before engine-specific imports. IDA engine initialization belongs to Nexus. Neither supervisor initializes an engine.
 
-**IDA:** `bootstrap()` handles the `idapro` import ordering constraint (see [below](#import-ordering-constraint-ida-backend)). The supervisor avoids calling it, which also avoids the idalib license cost.
+**IDA:** Nexus initializes the engine. Schema discovery registers the existing tools/resources in a temporary licensed Nexus instance and reads FastMCP's live schemas. The probe uses a private throwaway binary because Nexus's execution API requires an IDB. It is closed and deleted after discovery; metadata is cached only for the supervisor's lifetime.
 
 **Ghidra:** `bootstrap()` starts the JVM via pyghidra's `HeadlessPyGhidraLauncher` before any Ghidra Java classes are imported.
 
-### Import ordering constraint (IDA backend)
+### Import ordering constraint (IDA)
 
-idalib requires that `import idapro` happen before any `ida_*` module is imported. The `bootstrap()` function in `re_mcp_ida.__init__` handles this:
-
-```python
-# packages/re-mcp-ida/src/re_mcp_ida/server.py (worker entry point)
-import re_mcp_ida
-re_mcp_ida.bootstrap()  # Initialize idalib before any ida_* imports
-```
-
-`bootstrap()` first tries a normal `import idapro`. If that fails, it locates the `idapro` wheel from the local IDA installation and adds it to `sys.path`.
-
-After `bootstrap()` runs, `ida_*` imports can be top-level in all other modules — they're guaranteed to run after `idapro` has initialized the IDA kernel.
+Nexus initializes idalib before remote tool registration, or executes inside an
+already-initialized GUI. Therefore `ida_*` imports remain top-level in tool modules.
+There is no `re_mcp_ida` idalib bootstrap, engine executor, or standalone worker
+process. The IDA backend uses only its in-process transport factory.
 
 ### Session singleton
 
@@ -124,9 +129,11 @@ Key behaviors:
 - `session.require_open` is a decorator that raises `BackendError` if no database is open. Since `BackendError` subclasses FastMCP's `ToolError`, FastMCP automatically returns `isError=True` with the message as text content
 - The worker's `main()` function calls `session.close(save=True)` in its `finally` block on shutdown
 
-IDA-specific session behaviors:
-- The decorator clears IDA's cancellation flag before each call and catches `Cancelled` exceptions, re-raising them as `IDAError`
-- Signal handlers: `SIGTERM` raises `SystemExit` (triggers shutdown cleanup and save), `SIGINT` first press sets IDA's cancellation flag / second press escalates to shutdown, `SIGUSR1` sets the cancellation flag without escalation (cooperative cancellation from supervisor)
+IDA's remote `Session` is instead a **non-owning view** of Nexus's current IDB.
+It neither opens/closes databases nor installs signal handlers or clears the
+cancellation flag. The engine-free `NexusSession` in `nexus.py` owns the lease;
+its lifespan saves/releases it. Cancellation uses `DatabaseHandle.cancel_active`.
+No Nexus/GUI PID is exposed to the supervisor's kill/death-watcher code.
 
 ### Multi-database supervisor and provider architecture
 
@@ -157,7 +164,7 @@ Management tools delegate to `WorkerPoolProvider` methods for worker lifecycle a
 - `detach_all(session_id, terminate=True)` detaches a session from all workers under `_lock`. When `terminate=True` (default), workers whose session set becomes empty are shut down; `terminate=False` detaches for bookkeeping only (used by the disconnect callback). Falls back to `shutdown_all()` when session ID is `None`.
 - `build_database_list(include_state, caller_session_id)` returns all open databases with metadata and a `session_count` per entry; when `caller_session_id` is provided, each entry also includes an `attached` flag.
 
-Tool/resource schemas are bootstrapped lazily from a temporary worker on first access. `RoutingTool` and `RoutingTemplate` both set `task_config = TaskConfig(mode="optional")`.
+Tool/resource schemas are bootstrapped lazily on first access. Ghidra uses a temporary subprocess. IDA's optional `create_worker_transport()` backend hook returns an in-process FastMCP adapter that discovers schemas from live registrations in a temporary Nexus instance. `RoutingTool` and `RoutingTemplate` both set `task_config = TaskConfig(mode="optional")`.
 
 All tools except management tools (`open_database`, `close_database`, `save_database`, `list_databases`, `wait_for_analysis`, `list_targets`) require the `database` parameter (the stem ID returned by `open_database` or `list_databases`).
 
@@ -175,13 +182,13 @@ After analysis completes, worker metadata (function count, etc.) is refreshed vi
 
 Mach-O universal ("fat") binaries contain multiple architecture slices. Before spawning a worker, `open_database` calls `check_fat_binary` (in `re_mcp_ida.exceptions`), which parses the on-disk `FAT_MAGIC` / `FAT_MAGIC_64` header via `detect_fat_slices` and refuses to proceed without an explicit `fat_arch` parameter — headless idalib would otherwise silently pick a default slice. The resulting `IDAError` uses `error_type="AmbiguousFatBinary"` and includes an `available` detail listing the slice names (`x86_64`, `arm64`, `arm64e`, ...).
 
-`check_fat_binary` returns the slice's 1-based position in the on-disk fat header, which `build_ida_args` emits as `-T"Fat Mach-O file, <index>"` — the only documented way to pick a slice in headless mode. Because the fat-slice selector already uses `-T`, `loader` cannot be combined with `fat_arch`.
+`check_fat_binary` returns the slice's 1-based position in the on-disk fat header, which the Nexus adapter passes as `file_type="Fat Mach-O file, <index>"` — the only documented way to pick a slice in headless mode. Because the fat-slice selector already uses `-T`, `loader` cannot be combined with `fat_arch`.
 
-Per-slice sidecars are stored at `<binary>.<arch>.i64` (via an `-o<stem>` override in `Session.open`) so multiple architectures of the same universal binary coexist on disk. The check short-circuits on existing `.i64`/`.idb` databases (and on matching per-slice sidecars unless `force_new=True`), since stored analysis already pins a slice. To analyze multiple slices from the same file concurrently, open once per slice with distinct `database_id` values.
+Per-slice sidecars are stored at `<binary>.<arch>.i64` (via Nexus's `output_database` option) so multiple architectures of the same universal binary coexist on disk. The check short-circuits on existing `.i64`/`.idb` databases (and on matching per-slice sidecars unless `force_new=True`), since stored analysis already pins a slice. To analyze multiple slices from the same file concurrently, open once per slice with distinct `database_id` values.
 
 #### Per-worker concurrency
 
-Because both backends use single-threaded or global-state analysis engines, requests to the same worker are serialized by the worker's single-threaded MCP transport. The `dispatch()` async context manager tracks active call count and activity timestamps. Requests to *different* workers run fully in parallel. The `Worker.state` property derives the effective state (BUSY/IDLE) from the `_active_calls` counter rather than requiring manual state transitions.
+Because both engines are thread-affine, requests to the same adapter are serialized. IDA uses an adapter lock and Nexus's engine dispatch; Ghidra uses its worker executor. The `dispatch()` async context manager tracks active call count and activity timestamps. Requests to *different* workers run fully in parallel. The `Worker.state` property derives the effective state (BUSY/IDLE) from the `_active_calls` counter rather than requiring manual state transitions.
 
 Crashed workers are detected on-demand when tool calls or resource reads encounter connection errors (`ClosedResourceError`, `EndOfStream`, `BrokenPipeError`/`OSError`, `McpError` with connection-closed code) — `proxy_to_worker()` and `RoutingTemplate._read()` call `mark_worker_dead()` to clean up.
 
@@ -299,15 +306,18 @@ The default limit is 100 for most tools. Some tools use smaller defaults: 50 for
 | Module | Role |
 |--------|------|
 | `backend.py` | `IDABackend` — implements the `Backend` protocol; registers `open_database`, prompts, IDA-specific LLM instructions, and target listing |
-| `server.py` | Worker entry point (`re-mcp-ida-worker`) — creates `IDAServer` (a `BackendServer` subclass), auto-discovers and registers all tool modules from `tools/`, runs stdio transport |
-| `session.py` | Database session singleton (per worker), `require_open` decorator |
-| `exceptions.py` | `IDAError(BackendError)` — IDA-specific structured error type, plus idalib-safe validation utilities (`build_ida_args`, `check_processor_ambiguity`, `check_fat_binary`, `detect_fat_slices`, `slice_sidecar_stem`, `AMBIGUOUS_PROCESSORS`, `PRIMARY_IDB_EXTENSIONS`) |
-| `helpers.py` | Address parsing, formatting, pagination, resolution helpers, string decoding, MCP annotation presets, meta presets, `Annotated` parameter type aliases, `call_ida` main-thread dispatch, `@ida_dispatch` marker |
+| `server.py` | In-process `IDAServer(FastMCP)` — serves runtime-discovered schemas and forwards tools/resources to Nexus |
+| `nexus.py` | Engine-free `DatabaseHandle` lease ownership, import-option translation, analysis waits and cancellation |
+| `nexus_runtime.py` | `RemoteModule` dispatcher running existing tools on Nexus's IDA thread |
+| `cli_options.py` | Validates and translates IDA CLI switches into Nexus's typed import settings |
+| `session.py` | Non-owning view of Nexus's IDB inside IDA, plus `require_open` decorator |
+| `exceptions.py` | `IDAError(BackendError)` — IDA-specific structured error type, plus idalib-safe validation utilities (`check_processor_ambiguity`, `check_fat_binary`, `detect_fat_slices`, `slice_sidecar_stem`, `AMBIGUOUS_PROCESSORS`, `PRIMARY_IDB_EXTENSIONS`) |
+| `helpers.py` | Address parsing, formatting, pagination, resolution helpers, string decoding, MCP annotation presets, meta presets, `Annotated` parameter type aliases, `call_ida`/pagination helpers that stay on Nexus's IDA thread, `@ida_dispatch` marker |
 | `models.py` | Re-exports shared Pydantic models from `re_mcp.models` (e.g. `FunctionSummary`, `RenameResult`, `PaginatedResult`) for convenient single-source imports. Tool-specific models live in their respective tool modules; FastMCP derives the JSON output schema from each tool's return type annotation |
 | `transforms.py` | IDA-specific tool visibility constants — `PINNED_TOOLS` and `MANAGEMENT_TOOLS` frozensets |
 | `resources.py` | MCP resources — read-only, cacheable context endpoints (static binary data + aggregate statistics) |
 | `prompts/` | MCP prompt templates for guided analysis workflows (analysis, security, workflow) |
-| `__init__.py` | Lazy `bootstrap()` to initialize idapro, plus `find_ida_dir()` for IDA installation discovery |
+| `__init__.py` | `find_ida_dir()` for target listing; does not initialize or manage IDA |
 | `_cli.py` | Convenience CLI entry point — `re-mcp-ida` is equivalent to `re-mcp --backend ida` |
 
 ### `re-mcp-ghidra` modules (`packages/re-mcp-ghidra/src/re_mcp_ghidra/`)
@@ -350,7 +360,7 @@ def register(mcp: FastMCP):
 ```
 
 Key conventions:
-- Backend-specific imports are top-level (safe because the worker calls `bootstrap()` before importing tool modules). Tool modules are auto-discovered via `pkgutil.iter_modules` — any `tools/*.py` with a `register(mcp)` function is loaded automatically
+- Backend-specific imports are top-level (safe because Nexus has initialized IDA, or the Ghidra worker has bootstrapped its engine). Tool modules are auto-discovered via `pkgutil.iter_modules` — any `tools/*.py` with a `register(mcp)` function is loaded automatically
 - `@session.require_open` is applied to all worker tools that need a database
 - Every tool has MCP annotations (`ANNO_READ_ONLY`, `ANNO_MUTATE`, `ANNO_MUTATE_NON_IDEMPOTENT`, or `ANNO_DESTRUCTIVE`) and `tags=` for categorical grouping. IDA tools may also have `meta=` presets (`META_DECOMPILER`, `META_BATCH`, `META_READS_FILES`, `META_WRITES_FILES`) for static metadata
 - Use `Annotated` type aliases (`Address`, `Offset`, `Limit`, `FilterPattern`, `HexBytes`) for parameter types — they embed descriptions and validation constraints directly into the JSON schema. `OperandIndex` is available in the IDA backend only
@@ -453,6 +463,6 @@ For the Ghidra backend, the same steps apply under `packages/re-mcp-ghidra/`.
 
 - `ida_ida.get_inf_structure()` is **removed** — use free functions: `ida_ida.inf_get_min_ea()`, `ida_ida.inf_get_max_ea()`, `ida_ida.inf_get_start_ea()`, `ida_ida.inf_get_app_bitness()`, `ida_ida.inf_is_64bit()`, etc.
 - IDAPython `.so` modules use stable ABI (no cpython version tag) — works with Python 3.12+
-- `idapro.open_database(path, run_auto_analysis)` returns 0 on success
+- Nexus owns database open/close and engine process lifetimes; use its leases and typed open options
 - The target binary must be in a writable directory (IDA creates `.i64` alongside it)
-- idalib is single-threaded — all calls must be on the thread that imported `idapro`
+- All IDA calls run on Nexus's selected IDA thread, never on a local adapter executor

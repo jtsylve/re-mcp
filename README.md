@@ -2,7 +2,7 @@
 
 A multi-backend reverse-engineering [MCP](https://modelcontextprotocol.io/) server. Exposes binary analysis capabilities from [IDA Pro](https://hex-rays.com/ida-pro/) and [Ghidra](https://ghidra-sre.org/) over the Model Context Protocol, letting LLMs drive reverse-engineering tools directly. Supports multiple simultaneous databases through a supervisor/worker architecture.
 
-Both backends are standalone servers, not plugins. They use headless APIs ([idalib](https://docs.hex-rays.com/release-notes/9_0#idalib-ida-as-a-library) for IDA, [pyghidra](https://github.com/NationalSecurityAgency/ghidra/tree/master/Ghidra/Features/PyGhidra) for Ghidra) to run analysis engines without a GUI.
+The IDA backend uses [IDA Nexus](https://github.com/HexRaysSA/ida-nexus) to share GUI databases or managed headless workers. Ghidra uses [pyghidra](https://github.com/NationalSecurityAgency/ghidra/tree/master/Ghidra/Features/PyGhidra) headlessly. See [Nexus setup, ownership, and compatibility](docs/ida-nexus.md).
 
 ## Backends
 
@@ -43,6 +43,8 @@ pip install re-mcp re-mcp-ida re-mcp-ghidra  # Unified CLI with both backends
 
 ### From source
 
+`uv sync` installs IDA Nexus from PyPI; no sibling checkout is required.
+
 ```bash
 git clone https://github.com/jtsylve/ida-mcp && cd ida-mcp
 uv sync
@@ -57,7 +59,10 @@ pip install -e packages/re-mcp-core -e packages/re-mcp-ida -e packages/re-mcp-gh
 
 ### Finding IDA Pro
 
-The IDA backend looks for your IDA Pro installation in the following order:
+Nexus/ida-domain handles IDA initialization; configure idalib as described in the
+[Nexus documentation](https://github.com/HexRaysSA/ida-nexus). GUI attachment also
+requires the Nexus plugin. The `list_targets` helper locates processor/loader files
+in the following order:
 
 1. **`IDADIR` environment variable** — checked first; set this if IDA is in a non-standard location.
 2. **IDA's own config file** — `Paths.ida-install-dir` in `~/.idapro/ida-config.json` (macOS/Linux) or `%APPDATA%\Hex-Rays\IDA Pro\ida-config.json` (Windows). If the `IDAUSR` environment variable is set, it is used as the config directory instead.
@@ -69,7 +74,7 @@ The IDA backend looks for your IDA Pro installation in the following order:
 | Windows  | `C:\Program Files\IDA Professional 9.3`, `C:\Program Files\IDA Pro 9.3`, and `Program Files (x86)` equivalents |
 | Linux    | `/opt/ida-pro-9.3`, `/opt/idapro-9.3`, `/opt/ida-9.3`, `~/ida-pro-9.3`, `~/idapro-9.3` |
 
-The `idapro` package is loaded at runtime directly from your local IDA Pro installation — no extra setup steps or environment variables are needed if IDA is installed in a standard location.
+MCP tool discovery initializes a temporary licensed IDA instance through Nexus and reads the live tool/resource schemas, as RE-MCP previously did with a temporary worker. No generated schema files are needed.
 
 ### Finding Ghidra
 
@@ -105,13 +110,13 @@ Both CLIs support the same subcommands:
 
 | Command | Description |
 |---------|-------------|
-| `<backend>` (or `<backend> stdio`) | Direct stdio mode — single-session, workers die on disconnect (default) |
+| `<backend>` (or `<backend> stdio`) | Direct stdio mode — session-scoped backend connections (default) |
 | `<backend> proxy` | Stdio proxy that auto-spawns a persistent HTTP daemon |
 | `<backend> serve` | Start the HTTP daemon directly (for manual daemon management) |
 | `<backend> stop` | Gracefully shut down a running daemon |
 | `<backend> backends` | List installed backends (most useful with the unified `re-mcp` CLI) |
 
-The default mode runs a direct stdio server — the simplest transport, widely supported across MCP clients. Workers die when the client disconnects.
+The default mode runs a direct stdio server — the simplest transport, widely supported across MCP clients. Ghidra workers exit on disconnect. IDA releases its Nexus leases; shared GUI/worker instances remain owned by Nexus and their other clients (see the [Windows launcher caveat](docs/ida-nexus.md)).
 
 For persistent state across reconnections, use `<backend> proxy`. This mode auto-spawns a persistent HTTP daemon behind the scenes, handling port allocation and authentication transparently. Workers and database state survive client reconnections. The daemon shuts down automatically after 5 minutes of inactivity (configurable via `<PREFIX>IDLE_TIMEOUT`).
 

@@ -131,8 +131,8 @@ class BackendInfo:
     uri_scheme: str
     """URI scheme for MCP resources (e.g. ``"ida"``, ``"ghidra"``)."""
 
-    worker_module: str
-    """Python module to run as ``python -m <module>`` for workers."""
+    worker_module: str | None
+    """Subprocess worker module, or None when the backend supplies its own transport."""
 
     pinned_tools: frozenset[str]
     """Tools that are always visible in the tool listing."""
@@ -149,7 +149,12 @@ class BackendInfo:
 
 @runtime_checkable
 class Backend(Protocol):
-    """Contract between core infrastructure and a backend implementation."""
+    """Contract between core infrastructure and a backend implementation.
+
+    Shared-engine backends may additionally expose ``create_worker_transport()``
+    returning a FastMCP ClientTransport. Without that optional hook, the provider
+    launches ``info().worker_module`` via stdio as before.
+    """
 
     @staticmethod
     def info() -> BackendInfo:

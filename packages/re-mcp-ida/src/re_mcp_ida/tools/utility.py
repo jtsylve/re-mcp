@@ -114,7 +114,11 @@ def register(mcp: FastMCP):
             )
         return EvaluateExpressionResult(expression=expression, result=str(result))
 
-    if os.environ.get("IDA_MCP_ALLOW_SCRIPTS", "").lower() in ("1", "true", "yes"):
+    if getattr(
+        mcp,
+        "allow_scripts",
+        os.environ.get("IDA_MCP_ALLOW_SCRIPTS", "").lower() in ("1", "true", "yes"),
+    ):
 
         @mcp.tool(
             annotations=ANNO_DESTRUCTIVE,

@@ -33,6 +33,7 @@ import anyio
 import mcp.types as types
 from fastmcp import Client
 from fastmcp.client import StdioTransport
+from fastmcp.client.transports import ClientTransport
 from fastmcp.exceptions import ResourceError, ToolError
 from fastmcp.resources.base import ResourceContent, ResourceResult
 from fastmcp.resources.template import ResourceTemplate
@@ -867,8 +868,19 @@ class WorkerPoolProvider(Provider):
     # Transport factory
     # ------------------------------------------------------------------
 
-    def _worker_transport(self, label: str = "bootstrap") -> StdioTransport:
+    def _worker_transport(self, label: str = "bootstrap") -> ClientTransport:
+        # Shared-engine adapters can supply an in-process transport. In
+        # particular, a Nexus-owned process must not inherit the stdio SDK's
+        # Windows kill-on-close Job Object. Traditional backends keep stdio.
+        factory = getattr(self._backend, "create_worker_transport", None)
+        if factory is not None:
+            return factory()
         info = self._backend_info
+        if info.worker_module is None:
+            raise BackendError(
+                f"Backend {info.name!r} defines neither a worker module nor a transport factory",
+                error_type="ConfigurationError",
+            )
         env = dict(os.environ)
         # Propagate the supervisor's run ID and label to the worker so
         # its Python logging file and our stderr-capture file share a

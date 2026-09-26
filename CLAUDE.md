@@ -32,9 +32,10 @@ Key points for editing:
 - **Supervisor** (`re_mcp.supervisor`): entry point, `ProxyMCP(FastMCP)` + `WorkerPoolProvider`. Registers generic management tools (`close_database`, `save_database`, `list_databases`, `wait_for_analysis`, `list_targets`); each backend registers `open_database` via `backend.py`. Management tools use `try_get_session_id()` (from `re_mcp.context`). Most omit `ctx` from their signature; `save_database` is the exception (it accepts `ctx` for heartbeat progress notifications, but FastMCP strips it from the JSON schema).
 - **Backends** (`re_mcp_ida.backend`, `re_mcp_ghidra.backend`): implement the `Backend` protocol — register `open_database`, prompts, backend-specific instructions, and target listing. Discovered via `re_mcp.backends` entry points.
 - **Worker provider** (`re_mcp.worker_provider`): `WorkerPoolProvider(Provider)`, `RoutingTool(Tool)`, `RoutingTemplate(ResourceTemplate)`, `Worker` dataclass. Session-scoped ownership under `_lock` — `close_for_session()` and `detach_all()` are atomic. `ensure_session_cleanup()` registers a disconnect callback on the MCP session's exit stack.
-- **Workers** (`re_mcp_ida.server`, `re_mcp_ghidra.server`): one per database, stdio transport. Entry points: `re-mcp-ida-worker`, `re-mcp-ghidra-worker`.
-- **Bootstrap-safe modules** (importable without `bootstrap()`): all `re_mcp` modules, plus `<backend>.exceptions`, `<backend>.models`, `<backend>.transforms`, `<backend>.prompts/`. The supervisor never imports backend-engine-required modules.
+- **Workers/adapters**: Ghidra uses one stdio subprocess per database. IDA uses an in-process `IDAServer` via the optional backend `create_worker_transport()` hook; `NexusSession` owns a shared `DatabaseHandle` lease. IDA has no subprocess worker entry point or local idalib bootstrap. Never signal/kill a Nexus or GUI PID. See `docs/ida-nexus.md`.
+- **Engine-independent modules** (importable without initializing an engine): all `re_mcp` modules, plus `<backend>.exceptions`, `<backend>.models`, `<backend>.transforms`, `<backend>.prompts/`. The supervisor never imports backend-engine-required modules.
 - **Engine-required modules**: `<backend>.helpers`, `<backend>.session`, `<backend>.tools/`, `<backend>.resources`. Backend-specific imports — only loaded in worker processes.
+- IDA adapters discover schemas at startup from live tool registrations in a temporary licensed Nexus instance. `nexus_runtime.py` handles registration and remote execution; there are no generated schema files or regeneration steps.
 - `@session.require_open` (no parens) — decorator on nearly every tool
 - All tools return Pydantic models on success; raise `BackendError` subclass on failure (`IDAError` / `GhidraError`)
 
@@ -53,8 +54,8 @@ Key points for editing:
 ## IDA 9 API
 
 - `ida_ida.get_inf_structure()` is **removed** — use free functions: `ida_ida.inf_get_min_ea()`, `ida_ida.inf_get_max_ea()`, `ida_ida.inf_get_start_ea()`, `ida_ida.inf_get_app_bitness()`, `ida_ida.inf_is_64bit()`, etc.
-- idalib is single-threaded: all IDA calls must happen on the same thread that imported `idapro`
-- `idapro.open_database(path, run_auto_analysis)` returns 0 on success. `run_auto_analysis` defaults to `False` — pass `True` only for first-time analysis of a new binary (no existing `.i64`). The binary must be in a writable directory (IDA creates `.i64` alongside it).
+- All IDA calls must run through Nexus on its selected IDA thread. Do not introduce local engine executors or initialize idalib in the supervisor.
+- Use Nexus `DatabaseHandle` leases and typed `DatabaseOpenOptions`; do not call idapro database open/close functions or manage IDA process lifetimes. Fresh imports need a writable output directory.
 
 ## Lint / Style
 

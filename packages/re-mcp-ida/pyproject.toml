@@ -1,7 +1,7 @@
 [project]
 name = "re-mcp-ida"
 version = "3.0.4.dev1"
-description = "IDA Pro backend for re-mcp — headless IDA Pro MCP server using idalib"
+description = "IDA Pro backend for re-mcp using shared IDA Nexus databases"
 license = "MIT OR Apache-2.0"
 authors = [
     { name = "Joe T. Sylve, Ph.D.", email = "joe.sylve@gmail.com" }
@@ -19,6 +19,8 @@ classifiers = [
 readme = "README.md"
 dependencies = [
     "re-mcp-core>=0.1.0",
+    "ida-nexus>=0.13.0,<0.14",
+    "jsonschema>=4.20,<5",
 ]
 
 [project.urls]
@@ -29,7 +31,6 @@ Documentation = "https://github.com/jtsylve/ida-mcp/tree/main/docs"
 
 [project.scripts]
 re-mcp-ida = "re_mcp_ida._cli:main"
-re-mcp-ida-worker = "re_mcp_ida.server:main"
 
 [project.entry-points."re_mcp.backends"]
 ida = "re_mcp_ida.backend:IDABackend"

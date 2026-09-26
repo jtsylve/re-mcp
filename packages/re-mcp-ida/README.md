@@ -1,8 +1,15 @@
 # re-mcp-ida
 
-IDA Pro backend for [RE-MCP](https://github.com/jtsylve/ida-mcp) — a headless [IDA Pro](https://hex-rays.com/ida-pro/) MCP server using [idalib](https://docs.hex-rays.com/release-notes/9_0#idalib-ida-as-a-library). Exposes IDA's full analysis capabilities over the [Model Context Protocol](https://modelcontextprotocol.io/), letting LLMs drive reverse engineering directly.
+IDA Pro backend for [RE-MCP](https://github.com/jtsylve/ida-mcp), using
+[IDA Nexus](https://github.com/HexRaysSA/ida-nexus) to share GUI databases or
+managed headless workers. Existing structured analysis tools and resources are
+preserved. Closing releases this MCP adapter's lease, not another client's database.
 
-This is a standalone server, not an IDA plugin. It uses idalib to run IDA's analysis engine without a GUI.
+See [Nexus setup and compatibility](../../docs/ida-nexus.md) for GUI dependencies,
+Windows launcher constraints, and lifecycle differences. CLI `options` are
+translated to Nexus's typed import options; unsupported switches fail explicitly.
+Tool discovery uses a licensed IDA instance. In-place snapshot restoration is
+not supported for shared databases.
 
 ## Requirements
 
@@ -24,7 +31,11 @@ pip install re-mcp-ida
 
 ## Finding IDA Pro
 
-The server looks for your IDA Pro installation in the following order:
+Configure idalib through Nexus/ida-domain. To attach to a GUI, install the Nexus
+plugin; IDA's Python must be 3.12+ with compatible RE-MCP dependencies available.
+IDA Nexus is installed from PyPI automatically by `uv sync` or pip.
+
+The `list_targets` helper looks for processor/loader modules in the following order:
 
 1. **`IDADIR` environment variable** — set this if IDA is in a non-standard location.
 2. **IDA's config file** — `Paths.ida-install-dir` in `~/.idapro/ida-config.json` (macOS/Linux) or `%APPDATA%\Hex-Rays\IDA Pro\ida-config.json` (Windows).
@@ -59,7 +70,7 @@ uvx re-mcp-ida
 
 | Command | Description |
 |---------|-------------|
-| `re-mcp-ida` (or `re-mcp-ida stdio`) | Direct stdio mode — single-session, workers die on disconnect (default) |
+| `re-mcp-ida` (or `re-mcp-ida stdio`) | Direct stdio mode — releases Nexus leases on disconnect (default) |
 | `re-mcp-ida proxy` | Stdio proxy that auto-spawns a persistent HTTP daemon |
 | `re-mcp-ida serve` | Start the HTTP daemon directly |
 | `re-mcp-ida stop` | Gracefully shut down a running daemon |

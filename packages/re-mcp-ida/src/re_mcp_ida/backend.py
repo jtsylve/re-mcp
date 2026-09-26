@@ -13,13 +13,8 @@ from typing import TYPE_CHECKING
 from re_mcp.backend import BackendInfo, build_instructions
 
 from re_mcp_ida import find_ida_dir
-from re_mcp_ida.exceptions import (
-    IDAError,
-    build_ida_args,
-    check_fat_binary,
-    check_processor_ambiguity,
-    slice_sidecar_stem,
-)
+from re_mcp_ida.exceptions import IDAError, slice_sidecar_stem
+from re_mcp_ida.nexus import open_options
 from re_mcp_ida.transforms import MANAGEMENT_TOOLS, PINNED_TOOLS
 
 if TYPE_CHECKING:
@@ -51,7 +46,7 @@ class IDABackend:
             name="ida",
             display_name="IDA Pro",
             uri_scheme="ida",
-            worker_module="re_mcp_ida.server",
+            worker_module=None,
             pinned_tools=PINNED_TOOLS,
             management_tools=MANAGEMENT_TOOLS,
             env_prefix="IDA_MCP_",
@@ -59,10 +54,23 @@ class IDABackend:
         )
 
     @staticmethod
+    def create_worker_transport():
+        """Nexus owns the engine; no extra engine/stdio subprocess is needed."""
+        from fastmcp.client.transports import FastMCPTransport  # noqa: PLC0415
+
+        from re_mcp_ida.server import IDAServer  # noqa: PLC0415
+
+        return FastMCPTransport(IDAServer("IDA Nexus adapter", on_duplicate="error"))
+
+    @staticmethod
     def build_instructions(transform: ToolTransform) -> str:
         return build_instructions(
             transform=transform,
-            intro="IDA Pro binary analysis server with multi-database support.",
+            intro=(
+                "IDA Pro binary analysis server using shared IDA Nexus databases. "
+                "Opening a path reuses a registered GUI or headless instance when available. "
+                "Closing releases our lease; it never closes a shared GUI."
+            ),
             file_path_detail=(
                 "file_path accepts raw binaries or existing .i64/.idb databases. "
                 "The binary must be in a writable directory. "
@@ -119,8 +127,8 @@ class IDABackend:
             Each agent calls open_database then wait_for_analysis. Do NOT
             serialize open+wait calls — that blocks parallel loading.
 
-            **force_new=True** is destructive: deletes existing .i64/.idb
-            and all prior analysis. Use only for stale/incompatible DBs.
+            **force_new=True** is destructive: replaces stored analysis.
+            Nexus refuses this while another instance owns the database.
 
             **Fat Mach-O:** requires explicit *fat_arch* (e.g. ``arm64``).
             Error lists available slices. Use distinct *database_id* per
@@ -145,17 +153,19 @@ class IDABackend:
                 fat_arch: Mach-O fat slice (``x86_64``, ``arm64``, etc.).
                           Required for fat binaries; must be omitted for
                           thin files and existing databases.
-                options: Extra IDA CLI arguments. Do not duplicate
-                         processor/loader/base_address flags here.
+                options: Additional IDA CLI switches, translated to Nexus import
+                         options. Unsupported switches and duplicate settings fail
+                         explicitly. -o remains reserved for database identity.
             """
-            check_processor_ambiguity(processor, file_path, force_new, fat_arch)
-            fat_slice_index = check_fat_binary(file_path, fat_arch, force_new)
-            build_ida_args(
-                processor=processor,
-                loader=loader,
-                base_address=base_address,
-                fat_slice_index=fat_slice_index,
-                options=options,
+            translated = open_options(
+                file_path,
+                run_auto_analysis,
+                force_new,
+                processor,
+                loader,
+                base_address,
+                fat_arch,
+                options,
             )
 
             extra = {
@@ -172,10 +182,10 @@ class IDABackend:
 
             return await pool.open_database(
                 file_path,
-                run_auto_analysis,
+                translated.auto_analysis,
                 database_id,
                 keep_open,
-                force_new,
+                translated.new_database,
                 **extra,
             )
 

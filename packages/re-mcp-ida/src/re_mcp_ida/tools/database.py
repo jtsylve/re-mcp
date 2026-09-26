@@ -6,8 +6,6 @@
 
 from __future__ import annotations
 
-import os
-
 import ida_entry
 import ida_funcs
 import ida_ida
@@ -17,7 +15,6 @@ import ida_segment
 from fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
-from re_mcp_ida.exceptions import build_ida_args, check_fat_binary, check_processor_ambiguity
 from re_mcp_ida.helpers import (
     ANNO_DESTRUCTIVE,
     ANNO_MUTATE,
@@ -41,7 +38,7 @@ class OpenDatabaseResult(BaseModel):
 
     status: str = Field(description="Status message.")
     file_path: str = Field(description="Path to the opened database file.")
-    pid: int = Field(description="Worker process ID.")
+    pid: None = Field(default=None, description="Always null: IDA processes are owned by Nexus.")
     processor: str = Field(description="Processor architecture name.")
     bitness: int = Field(description="Address size in bits (16, 32, or 64).")
     file_type: str = Field(description="Input file type description.")
@@ -170,7 +167,7 @@ def register(mcp: FastMCP):
         """Open a binary or existing IDA database for analysis.
 
         This must be called before using any other analysis tools.
-        If a database is already open, it will be saved and closed first.
+        Reuses an existing Nexus GUI/worker or acquires a new managed worker lease.
 
         file_path can be a raw binary or an existing .i64/.idb database.
         When a database is passed, the original binary does not need to be present.
@@ -212,58 +209,26 @@ def register(mcp: FastMCP):
                       explicit ``.i64``/``.idb`` database paths
                       (stored analysis already pins the slice);
                       either combination raises ``InvalidArgument``.
-            options: Optional.  Additional IDA command-line arguments.
-                     Processor, loader, and base address flags are added
-                     automatically from the other parameters — do not
-                     duplicate them here.
+            options: Additional IDA CLI switches, translated to Nexus import
+                     options. Unsupported switches fail explicitly. Do not
+                     duplicate processor/loader/base_address; -o is reserved.
         """
-        # The supervisor also runs these fail-fast checks before spawning
-        # the worker.  We repeat them here so the worker's own open_database
-        # tool is safe when used standalone (e.g. direct worker connections
-        # or tests).  check_fat_binary returns the 1-based slice index
-        # (or None when no -T flag is needed) which feeds into build_ida_args.
-        check_processor_ambiguity(processor, file_path, force_new, fat_arch)
-        fat_slice_index = check_fat_binary(file_path, fat_arch, force_new)
-        ida_args = build_ida_args(
-            processor=processor,
-            loader=loader,
-            base_address=base_address,
-            fat_slice_index=fat_slice_index,
-            options=options,
-        )
-
-        open_result = session.open(
-            file_path,
-            run_auto_analysis,
-            force_new=force_new,
-            options=ida_args,
-            fat_arch=fat_arch,
-        )
-
-        return OpenDatabaseResult(
-            status="ok",
-            file_path=session.current_path,
-            pid=os.getpid(),
-            processor=ida_idp.get_idp_name(),
-            bitness=ida_ida.inf_get_app_bitness(),
-            file_type=ida_loader.get_file_type_name(),
-            function_count=ida_funcs.get_func_qty(),
-            segment_count=ida_segment.get_segm_qty(),
-            capabilities=session.capabilities,
-            warnings=open_result.get("warnings", []),
-        )
+        # Schema declaration only: the adapter handles this before remote dispatch.
+        raise IDAError("Database lifecycle is managed by IDA Nexus", error_type="Unsupported")
 
     @mcp.tool(
         annotations=ANNO_DESTRUCTIVE,
         tags={"database"},
     )
     def close_database(save: bool = True) -> CloseDatabaseResult:
-        """Close the currently open database.
+        """Release this MCP adapter's Nexus lease without closing shared GUIs.
 
         Args:
-            save: Whether to save changes to the IDB file.
+            save: Save explicitly before release. False skips that save, but
+                  Nexus may still save when its final managed lease is released;
+                  this option does not discard changes to a shared database.
         """
-        return CloseDatabaseResult(**session.close(save))
+        raise IDAError("Database lifecycle is managed by IDA Nexus", error_type="Unsupported")
 
     @mcp.tool(
         annotations=ANNO_READ_ONLY,

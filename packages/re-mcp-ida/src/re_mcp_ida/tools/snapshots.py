@@ -75,18 +75,6 @@ def _collect_tree(node: ida_loader.snapshot_t, depth: int = 0) -> list[dict]:
     return items
 
 
-def _find_snapshot(node: ida_loader.snapshot_t, snap_id: int) -> ida_loader.snapshot_t | None:
-    """Search the snapshot tree for a node with the given ID."""
-    if node.id == snap_id:
-        return node
-    if node.children:
-        for child in node.children:
-            found = _find_snapshot(child, snap_id)
-            if found is not None:
-                return found
-    return None
-
-
 def register(mcp: FastMCP):
     @mcp.tool(
         annotations=ANNO_MUTATE,
@@ -140,45 +128,16 @@ def register(mcp: FastMCP):
     )
     @session.require_open
     def restore_snapshot(snapshot_id: str) -> RestoreSnapshotResult:
-        """Revert the database to a prior snapshot (destroys unsaved changes).
+        """Unsupported for shared Nexus databases; open the snapshot separately.
 
-        Replaces the current database state with the snapshot state.
-        The current state is lost unless a snapshot was taken beforehand.
-
-        Works by saving the current database, closing it, and reopening
-        the snapshot's .i64 file — the only reliable approach in headless
-        idalib mode.
+        Replacing the database in-place would invalidate other clients' leases.
+        Use list_snapshots to find its file, then open_database with that path.
 
         Args:
-            snapshot_id: ID of the snapshot to restore (string from list_snapshots).
+            snapshot_id: ID of the snapshot (string from list_snapshots).
         """
-        try:
-            sid = int(snapshot_id)
-        except (ValueError, TypeError):
-            raise IDAError(
-                f"Invalid snapshot ID: {snapshot_id!r}", error_type="InvalidArgument"
-            ) from None
-
-        root = ida_loader.snapshot_t()
-        if not ida_loader.build_snapshot_tree(root):
-            raise IDAError("Failed to build snapshot tree", error_type="SnapshotFailed")
-
-        target = _find_snapshot(root, sid)
-        if target is None:
-            raise IDAError(f"Snapshot with ID {snapshot_id} not found", error_type="NotFound")
-
-        snap_file = target.filename
-        if not snap_file:
-            raise IDAError("Snapshot has no associated file", error_type="SnapshotFailed")
-
-        desc = target.desc
-
-        session.close(save=True)
-        session.open(snap_file, run_auto_analysis=False)
-
-        return RestoreSnapshotResult(
-            action="restored",
-            snapshot_id=snapshot_id,
-            description=desc,
-            file=snap_file,
+        raise IDAError(
+            "Open the snapshot as a separate database; shared Nexus databases "
+            "cannot be replaced in-place.",
+            error_type="Unsupported",
         )

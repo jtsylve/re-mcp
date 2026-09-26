@@ -19,8 +19,6 @@ import pytest
 from re_mcp_ida.exceptions import (
     AMBIGUOUS_PROCESSORS,
     IDAError,
-    append_output_flag,
-    build_ida_args,
     check_fat_binary,
     check_processor_ambiguity,
     detect_fat_slices,
@@ -148,100 +146,6 @@ def test_ida_error_with_details():
     err = IDAError("bad", error_type="X", valid_values=["a", "b"])
     parsed = json.loads(str(err))
     assert parsed["valid_values"] == ["a", "b"]
-
-
-# ---------------------------------------------------------------------------
-# build_ida_args
-# ---------------------------------------------------------------------------
-
-
-def test_build_ida_args_empty():
-    """No parameters produces None."""
-    assert build_ida_args() is None
-
-
-def test_build_ida_args_processor_only():
-    assert build_ida_args(processor="arm:ARMv7-M") == "-parm:ARMv7-M"
-
-
-def test_build_ida_args_loader_only():
-    assert build_ida_args(loader="ELF") == "-TELF"
-
-
-def test_build_ida_args_loader_with_spaces():
-    """Loader names with spaces must be quoted."""
-    result = build_ida_args(loader="Binary file")
-    assert result == '-T"Binary file"'
-
-
-def test_build_ida_args_base_address_hex():
-    result = build_ida_args(base_address="0x20000")
-    assert result == "-b0x2000"
-
-
-def test_build_ida_args_base_address_decimal():
-    result = build_ida_args(base_address="131072")
-    # 131072 == 0x20000, paragraph = 0x2000
-    assert result == "-b0x2000"
-
-
-def test_build_ida_args_base_address_not_aligned():
-    with pytest.raises(IDAError, match="not 16-byte aligned"):
-        build_ida_args(base_address="0x20001")
-
-
-def test_build_ida_args_base_address_invalid():
-    with pytest.raises(IDAError, match="Invalid base_address"):
-        build_ida_args(base_address="not_a_number")
-
-
-def test_build_ida_args_all_params():
-    result = build_ida_args(
-        processor="arm:ARMv7-M",
-        loader="Binary file",
-        base_address="0x8000000",
-    )
-    assert result == '-parm:ARMv7-M -T"Binary file" -b0x800000'
-
-
-def test_build_ida_args_options_passthrough():
-    result = build_ida_args(options="-a")
-    assert result == "-a"
-
-
-def test_build_ida_args_combined_with_options():
-    result = build_ida_args(processor="arm:ARMv7-M", options="-a")
-    assert result == "-parm:ARMv7-M -a"
-
-
-def test_build_ida_args_conflicting_processor_in_options():
-    """options containing -p should be rejected when processor is set."""
-    with pytest.raises(IDAError, match="processor"):
-        build_ida_args(processor="arm:ARMv7-M", options="-pmetapc")
-
-
-def test_build_ida_args_conflicting_loader_in_options():
-    with pytest.raises(IDAError, match="loader"):
-        build_ida_args(loader="ELF", options="-TBinary")
-
-
-def test_build_ida_args_conflicting_base_in_options():
-    with pytest.raises(IDAError, match="base_address"):
-        build_ida_args(base_address="0x10000", options="-b0x100")
-
-
-def test_build_ida_args_flag_in_options_without_structured_param():
-    """Flags in options are allowed when the corresponding structured param is empty."""
-    result = build_ida_args(options="-parm:ARMv7-M")
-    assert result == "-parm:ARMv7-M"
-
-
-def test_build_ida_args_no_false_positive_on_longer_flags():
-    """Substring matches inside longer flags must not trigger conflict detection."""
-    # "-p" should not match inside "--prefer-something"
-    result = build_ida_args(processor="arm:ARMv7-M", options="--prefer-something")
-    assert "-parm:ARMv7-M" in result
-    assert "--prefer-something" in result
 
 
 # ---------------------------------------------------------------------------
@@ -492,12 +396,10 @@ def test_check_fat_binary_idb_with_fat_arch_raises(tmp_path):
 def test_check_fat_binary_symlink_to_idb_with_fat_arch_raises(tmp_path):
     """A symlink-without-extension pointing at an ``.i64`` is still rejected.
 
-    Fail-fast parity with :meth:`session.Session.open`: the supervisor
-    path must catch the same mistake that session.open does, otherwise a
-    symlink name like ``./shortcut`` → ``real.i64`` combined with
-    ``fat_arch=arm64`` would slip past the fail-fast check and only error
-    later inside the worker.  ``check_fat_binary`` resolves the symlink
-    up front so the extension-based guard sees the real target.
+    A symlink name like ``./shortcut`` → ``real.i64`` combined with
+    ``fat_arch=arm64`` must fail before acquiring a Nexus lease.
+    ``check_fat_binary`` resolves the symlink up front so the
+    extension-based guard sees the real target.
 
     The error message must quote the user's **original** path (the
     symlink), not the resolved realpath, so the user sees what they
@@ -663,10 +565,8 @@ def test_reject_fat_arch_on_database_symlink_without_extension(tmp_path):
 def test_reject_force_new_on_database_idb_path(tmp_path):
     """force_new=True combined with an .i64 path is rejected.
 
-    Without this check, :meth:`Session.open` would strip the extension,
-    delete the database files, and then try to open the (possibly
-    missing) binary at the stem path — destroying the user's stored
-    analysis with nothing to recover to.
+    Fresh imports require the original binary, not the stored database.
+    Reject the wrong path type before acquiring a Nexus lease.
     """
     db = tmp_path / "thing.i64"
     db.write_bytes(b"\x00")
@@ -706,9 +606,7 @@ def test_reject_force_new_on_database_symlink_without_extension(tmp_path):
     Same realpath trick as :func:`reject_fat_arch_on_database`:
     without resolving, a symlink name like ``./shortcut`` →
     ``real.i64`` combined with ``force_new=True`` would slip past
-    the extension guard and reach :meth:`Session.open`, which would
-    then delete the stored database before discovering the binary
-    is missing.
+    the extension guard and incorrectly request a fresh import from Nexus.
     """
     db = tmp_path / "real.i64"
     db.write_bytes(b"\x00")
@@ -725,8 +623,8 @@ def test_check_fat_binary_force_new_with_database_path_rejected(tmp_path):
     """check_fat_binary must reject force_new=True on an .i64 path up front.
 
     Fail-fast integration check: the same user error should be caught
-    at the supervisor level (via check_fat_binary) without needing to
-    reach :meth:`Session.open`.
+    at the supervisor level (via check_fat_binary) without acquiring
+    a Nexus lease.
     """
     db = tmp_path / "thing.i64"
     db.write_bytes(b"\x00")
@@ -784,122 +682,3 @@ def test_slice_sidecar_stem_resolves_symlink(tmp_path):
     link.symlink_to(real)
     assert slice_sidecar_stem(str(link)) == slice_sidecar_stem(str(real))
     assert slice_sidecar_stem(str(link), "arm64") == slice_sidecar_stem(str(real), "arm64")
-
-
-# build_ida_args + fat_slice_index ------------------------------------------
-
-
-def test_build_ida_args_fat_slice_index_emits_fat_macho_loader():
-    """fat_slice_index emits -T"Fat Mach-O file, <N>" — IDA's only
-    documented way to pick a slice in headless mode."""
-    assert build_ida_args(fat_slice_index=2) == '-T"Fat Mach-O file, 2"'
-
-
-def test_build_ida_args_fat_slice_index_rejects_explicit_loader():
-    """loader and fat_slice_index both map to -T — reject the combination."""
-    with pytest.raises(IDAError, match="loader and fat_arch"):
-        build_ida_args(loader="Binary file", fat_slice_index=2)
-
-
-def test_build_ida_args_fat_slice_index_combined():
-    """fat_slice_index composes with processor and base_address in the usual order."""
-    # processor is typically auto-detected for Mach-O, but pinning it
-    # shouldn't conflict with the fat loader selection.
-    result = build_ida_args(
-        processor="arm:ARMv8-A",
-        fat_slice_index=2,
-        base_address="0x100000000",
-    )
-    # -b emits in paragraphs (addr >> 4), so 0x100000000 → 0x10000000.
-    assert result == '-parm:ARMv8-A -T"Fat Mach-O file, 2" -b0x10000000'
-
-
-def test_build_ida_args_fat_slice_index_rejects_t_in_options():
-    """Even without an explicit loader, -T in options conflicts with fat_slice_index."""
-    with pytest.raises(IDAError, match="loader"):
-        build_ida_args(fat_slice_index=2, options="-TELF")
-
-
-def test_build_ida_args_fat_slice_index_large_number():
-    """Large fat indices (up to the 32-slice cap) format correctly."""
-    assert build_ida_args(fat_slice_index=10) == '-T"Fat Mach-O file, 10"'
-
-
-# build_ida_args — -o is reserved for Session.open's sidecar redirection
-# -----------------------------------------------------------------------
-
-
-def test_build_ida_args_rejects_dash_o_in_options():
-    """``-o`` is reserved for Session.open's sidecar redirection."""
-    with pytest.raises(IDAError, match="-o"):
-        build_ida_args(options="-omycustom.i64")
-
-
-def test_build_ida_args_rejects_dash_o_after_whitespace():
-    """``-o`` is caught even when preceded by another flag."""
-    with pytest.raises(IDAError, match="-o"):
-        build_ida_args(options="--some-other-flag -omycustom.i64")
-
-
-def test_build_ida_args_rejects_dash_o_with_fat_slice_index():
-    """The -o reject fires before Session.open appends its own -o<stem>."""
-    with pytest.raises(IDAError, match="-o"):
-        build_ida_args(fat_slice_index=2, options="-osomewhere")
-
-
-def test_build_ida_args_dash_o_check_no_false_positive_on_long_option():
-    """``--no-output`` contains ``-o`` but the anchor skips it."""
-    result = build_ida_args(options="--no-output")
-    assert result == "--no-output"
-
-
-# append_output_flag --------------------------------------------------------
-
-
-def test_append_output_flag_none_options():
-    """``None`` options yields just the -o flag."""
-    assert append_output_flag(None, "/tmp/foo.arm64") == "-o/tmp/foo.arm64"
-
-
-def test_append_output_flag_empty_options():
-    """Empty-string options yields just the -o flag."""
-    assert append_output_flag("", "/tmp/foo.arm64") == "-o/tmp/foo.arm64"
-
-
-def test_append_output_flag_all_whitespace_options():
-    """All-whitespace options is treated the same as empty — no double space."""
-    assert append_output_flag("   ", "/tmp/foo.arm64") == "-o/tmp/foo.arm64"
-
-
-def test_append_output_flag_normal_options():
-    """Normal options get a single separator space before the -o flag."""
-    assert append_output_flag("-parm:ARMv8-A", "/tmp/foo.arm64") == "-parm:ARMv8-A -o/tmp/foo.arm64"
-
-
-def test_append_output_flag_strips_trailing_whitespace():
-    """Trailing whitespace in options must not produce a double space.
-
-    Regression guard: concatenating ``'-parm '`` and ``' -o...'`` with a
-    space separator would yield ``'-parm  -o...'``.  Harmless for IDA's
-    parser but ugly in debug logs, and this helper should normalize it.
-    """
-    assert (
-        append_output_flag("-parm:ARMv8-A ", "/tmp/foo.arm64") == "-parm:ARMv8-A -o/tmp/foo.arm64"
-    )
-    # Leading whitespace is stripped too, for symmetry.
-    assert (
-        append_output_flag("   -parm:ARMv8-A   ", "/tmp/foo.arm64")
-        == "-parm:ARMv8-A -o/tmp/foo.arm64"
-    )
-
-
-def test_append_output_flag_quotes_path_with_spaces():
-    """Paths containing spaces are double-quoted via quote_ida_arg."""
-    result = append_output_flag(None, "/tmp/my stem.arm64")
-    assert result == '-o"/tmp/my stem.arm64"'
-
-
-def test_append_output_flag_quotes_path_with_spaces_and_options():
-    """Stem quoting composes correctly with a non-empty options string."""
-    result = append_output_flag("-parm:ARMv8-A", "/tmp/my stem.arm64")
-    assert result == '-parm:ARMv8-A -o"/tmp/my stem.arm64"'

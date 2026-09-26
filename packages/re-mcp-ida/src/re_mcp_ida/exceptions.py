@@ -2,18 +2,16 @@
 #
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
-"""IDA MCP error types and idalib-safe validation.
+"""IDA MCP error types and engine-independent validation.
 
-Separated from ``helpers`` so that modules that cannot load idalib (e.g.
-the supervisor process) can still raise structured errors and validate
-parameters before spawning worker processes.
+Separated from ``helpers`` so the supervisor can raise structured errors and
+validate import parameters before acquiring a Nexus lease.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import re
 import struct
 from collections import Counter
 
@@ -165,133 +163,6 @@ def check_processor_ambiguity(
 
 
 # ---------------------------------------------------------------------------
-# IDA command-line args builder (idalib-safe)
-# ---------------------------------------------------------------------------
-
-
-def quote_ida_arg(value: str) -> str:
-    """Double-quote *value* if it contains whitespace.
-
-    IDA's C-level arg parser understands ``"double quoted"`` values but
-    not POSIX single quotes; paths / loader names with spaces must be
-    wrapped before being concatenated into the ``-T`` / ``-o`` / ...
-    flags handed to ``idapro.open_database``.
-    """
-    return f'"{value}"' if " " in value else value
-
-
-def append_output_flag(options: str | None, target_stem: str) -> str:
-    """Return *options* with a ``-o<target_stem>`` flag appended.
-
-    Used for a first-time fat-slice open in :meth:`session.Session.open`:
-    IDA writes the new ``.i64`` at ``target_stem.i64`` instead of the
-    default stem-alongside-input location.  ``options`` is stripped
-    before concatenation so a trailing space in the caller-supplied
-    string does not produce a double space in the final args — harmless
-    for IDA's parser but unsightly in debug logs.  ``None`` and
-    all-whitespace inputs are treated the same as the empty string.
-    """
-    flag = f"-o{quote_ida_arg(target_stem)}"
-    if options is None:
-        return flag
-    stripped = options.strip()
-    if not stripped:
-        return flag
-    return f"{stripped} {flag}"
-
-
-def build_ida_args(
-    *,
-    processor: str = "",
-    loader: str = "",
-    base_address: str = "",
-    fat_slice_index: int | None = None,
-    options: str = "",
-) -> str | None:
-    """Build an IDA command-line args string from structured parameters.
-
-    Returns ``None`` when no arguments are needed.  Raises :class:`IDAError`
-    on invalid *base_address*, on a *loader* / *fat_slice_index* conflict,
-    or when *options* duplicates a flag that is already provided by a
-    structured parameter.  ``-o`` is also reserved — :meth:`Session.open`
-    owns it for fresh fat-slice sidecar redirection.
-
-    When *fat_slice_index* is set it overrides *loader*: IDA's ``-T``
-    flag is emitted as ``-T"Fat Mach-O file, <index>"``, which is the
-    only documented way to pick a specific slice of a Mach-O universal
-    binary in headless mode.  The slice index is 1-based, in the order
-    the slices appear in the on-disk fat header.  *loader* and
-    *fat_slice_index* both use ``-T`` under the hood, so callers must
-    pick one — setting both raises ``InvalidArgument``.
-    """
-    if fat_slice_index is not None and loader:
-        raise IDAError(
-            "loader and fat_arch cannot both be specified — both map to "
-            "IDA's -T flag, and fat_arch selects the Fat Mach-O slice "
-            "loader implicitly.",
-            error_type="InvalidArgument",
-        )
-
-    # When a fat slice is requested, the ``-T`` value is a synthetic
-    # loader name built from the slice index.  Otherwise use the
-    # caller-provided loader string (possibly empty).
-    if fat_slice_index is not None:
-        effective_loader = f"Fat Mach-O file, {fat_slice_index}"
-    else:
-        effective_loader = loader
-
-    # Reject options that duplicate a structured parameter already in use.
-    # Match flags only at the start of the string or after whitespace to
-    # avoid false positives on longer flags (e.g. "-p" inside "--prefer").
-    # ``-o`` is reserved unconditionally — owned by Session.open's
-    # per-slice sidecar redirect.
-    if options:
-        for flag, value, param_name in (
-            ("-p", processor, "processor"),
-            ("-T", effective_loader, "loader"),
-            ("-b", base_address, "base_address"),
-        ):
-            if value and re.search(rf"(?:^|\s){re.escape(flag)}", options):
-                raise IDAError(
-                    f"options contains '{flag}' — use the {param_name} parameter instead "
-                    f"of passing '{flag}' in options to avoid duplicate flags.",
-                    error_type="InvalidArgument",
-                )
-        if re.search(r"(?:^|\s)-o", options):
-            raise IDAError(
-                "options contains '-o' — the -o<stem> flag is reserved "
-                "for Session.open's per-slice sidecar redirection and "
-                "must not be passed through the options parameter.",
-                error_type="InvalidArgument",
-            )
-
-    args_parts: list[str] = []
-    if processor:
-        args_parts.append(f"-p{processor}")
-    if effective_loader:
-        args_parts.append(f"-T{quote_ida_arg(effective_loader)}")
-    if base_address:
-        try:
-            addr = int(base_address, 0)
-        except ValueError:
-            raise IDAError(
-                f"Invalid base_address: {base_address!r}. "
-                "Provide a hex (0x...) or decimal integer.",
-                error_type="InvalidArgument",
-            ) from None
-        if addr & 0xF:
-            raise IDAError(
-                f"base_address {base_address} is not 16-byte aligned. "
-                "IDA requires paragraph alignment (multiple of 0x10).",
-                error_type="InvalidArgument",
-            )
-        args_parts.append(f"-b{addr >> 4:#x}")
-    if options:
-        args_parts.append(options)
-    return " ".join(args_parts) or None
-
-
-# ---------------------------------------------------------------------------
 # Mach-O fat binary detection (idalib-safe)
 # ---------------------------------------------------------------------------
 
@@ -438,10 +309,8 @@ def reject_fat_arch_on_database(file_path: str, fat_arch: str) -> None:
     Stored databases already pin a specific slice, so ``fat_arch`` on
     top is either contradictory (the stored analysis belongs to a
     different slice) or redundant (same slice, the arg does nothing).
-    Both sites that accept user input for ``(file_path, fat_arch)`` —
-    the supervisor's fail-fast path in :func:`check_fat_binary` and
-    :meth:`session.Session.open` for direct callers — share this
-    check, so the message lives here to keep them in sync.
+    All opens share this check through :func:`check_fat_binary` during
+    Nexus option translation, before acquiring a lease.
 
     *file_path* is resolved internally (see :func:`_is_primary_idb_path`)
     so a symlink without a ``.i64`` extension pointing at a stored
@@ -468,19 +337,10 @@ def reject_force_new_on_database(file_path: str, force_new: bool) -> None:
 
     ``force_new`` means *"discard the stored analysis and re-analyze
     from the original binary"*.  That only makes sense when *file_path*
-    names the binary — if it names the database itself (``.i64`` /
-    ``.idb``), :meth:`session.Session.open` would strip the extension,
-    delete the database files, and then try to open the (possibly
-    missing) binary at the stem path.  When the binary is absent, the
-    stored analysis is destroyed with nothing to re-analyze from and no
-    recovery path.  Even when the binary *is* present, passing the
-    database path with ``force_new=True`` is confusing — the path
-    refers to the thing being destroyed rather than the thing being
-    opened.
-
-    Fail fast at every entry point (supervisor, worker tool,
-    :meth:`Session.open`) so the user cannot destroy their stored
-    analysis by pointing ``file_path`` at the wrong thing.  *file_path*
+    names the binary, not the database itself (``.i64`` / ``.idb``).
+    Reject this combination before asking Nexus for a fresh import so the
+    user cannot destroy stored analysis by pointing at the wrong thing.
+    *file_path*
     is resolved internally (see :func:`_is_primary_idb_path`) so a
     symlink-without-extension pointing at an ``.i64`` is also rejected.
     """
@@ -503,9 +363,9 @@ def reject_force_new_on_database(file_path: str, force_new: bool) -> None:
 def check_fat_binary(file_path: str, fat_arch: str, force_new: bool) -> int | None:
     """Validate *fat_arch* for *file_path* and return the slice index.
 
-    Returns the **1-based** slice index suitable for passing to
-    :func:`build_ida_args` as ``fat_slice_index``, or ``None`` when no
-    fat-slice ``-T`` flag is needed — specifically:
+    Returns the **1-based** slice index for Nexus's ``file_type`` selector
+    (``Fat Mach-O file, <index>``), or ``None`` when no fat-slice loader
+    selection is needed — specifically:
 
     - *file_path* is already an ``.i64`` / ``.idb`` database (stored
       analysis pins the slice; *fat_arch* **must** be empty in that
@@ -522,9 +382,8 @@ def check_fat_binary(file_path: str, fat_arch: str, force_new: bool) -> int | No
     - ``InvalidArgument`` — *fat_arch* was set but the file is **not**
       a fat Mach-O (thin binary, non-Mach-O, ...), **or** *file_path*
       is an explicit ``.i64``/``.idb`` path, **or** *force_new* is
-      set on an ``.i64``/``.idb`` path (which would delete the stored
-      analysis before :meth:`Session.open` could find the binary to
-      re-analyze).  Silently ignoring any of these would let a user
+      set on an ``.i64``/``.idb`` path (which is not a valid source for
+      a fresh import).  Silently ignoring any of these would let a user
       mis-select a non-existent slice, expect a re-analysis that is
       not going to happen, or destroy their stored analysis with no
       recovery path; surfacing the error makes the mistake immediate,

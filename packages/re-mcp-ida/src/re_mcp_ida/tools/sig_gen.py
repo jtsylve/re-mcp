@@ -6,7 +6,8 @@
 
 from __future__ import annotations
 
-import idapro
+import sys
+
 from fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
@@ -34,9 +35,13 @@ def register(mcp: FastMCP):
         Args:
             only_pat: If True, only generate .pat file (no .sig compilation).
         """
-        if not hasattr(idapro, "make_signatures"):
+        # Importing idapro into a GUI would initialize a second IDA kernel.
+        # Only use it when Nexus already loaded it for a managed idalib worker.
+        idapro = sys.modules.get("idapro")
+        if idapro is None or not hasattr(idapro, "make_signatures"):
             raise IDAError(
-                "make_signatures is not available in this idalib version", error_type="NotAvailable"
+                "Signature generation requires an idalib instance with make_signatures support",
+                error_type="NotAvailable",
             )
 
         try:

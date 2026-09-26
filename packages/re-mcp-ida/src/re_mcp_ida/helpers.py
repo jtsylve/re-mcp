@@ -11,7 +11,7 @@ tool modules can import everything from a single place.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Annotated, Any
 
 import ida_bytes
@@ -39,13 +39,10 @@ from re_mcp.helpers import (
     HexBytes,
     Limit,
     Offset,
-    async_paginate_iter,
     compile_filter,
-    dispatch_to_main,
     format_address,
     paginate,
     paginate_iter,
-    set_main_executor,
 )
 
 from re_mcp_ida.exceptions import IDAError
@@ -97,13 +94,23 @@ __all__ = [
     "resolve_struct",
     "safe_type_size",
     "segment_bitness",
-    "set_main_executor",
     "validate_operand_num",
     "xref_type_name",
 ]
 
-# Backend dispatch alias
-call_ida = dispatch_to_main
+
+async def call_ida(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Run a helper on the IDA thread already selected by Nexus.
+
+    Existing async tools await this interface, but no executor or worker thread
+    is needed: the entire remote invocation is already running inside IDA.
+    """
+    return fn(*args, **kwargs)
+
+
+async def async_paginate_iter(items: Iterable[Any], offset: int = 0, limit: int = 100) -> dict:
+    """Consume lazy IDA iterators on the current Nexus-selected engine thread."""
+    return paginate_iter(items, offset, limit)
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +126,7 @@ OperandIndex = Annotated[int, Field(description="Operand index (0-based).", ge=0
 
 
 def ida_dispatch(fn: Callable[..., Any]) -> Callable[..., Any]:
-    """Mark a function as requiring main-thread dispatch.
+    """Mark a function as requiring Nexus's IDA execution thread.
 
     Functions decorated with ``@ida_dispatch`` contain IDA API calls and
     must be invoked via :func:`call_ida` or :func:`async_paginate_iter`
@@ -169,9 +176,8 @@ class Cancelled(Exception):
 def check_cancelled() -> None:
     """Raise :class:`Cancelled` if the IDA cancellation flag is set.
 
-    Call this between iterations in batch loops so that a SIGUSR1 from
-    the supervisor (which sets the flag via ``ida_kernwin.set_cancelled()``)
-    can interrupt long-running operations cooperatively.
+    Call this between iterations in batch loops so Nexus's operation-scoped
+    cancellation can interrupt long-running operations cooperatively.
     """
     if ida_kernwin.user_cancelled():
         raise Cancelled
