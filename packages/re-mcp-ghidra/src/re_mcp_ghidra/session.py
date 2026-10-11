@@ -215,15 +215,19 @@ class Session:
         if self._program is None or self._project is None:
             raise GhidraError("No database is open.", error_type="NoDatabase")
 
-        from ghidra.util.task import TaskMonitor  # noqa: PLC0415
-
-        self._end_open_transactions()
-
-        df = self._program.getDomainFile()
-        if df is not None and df.canSave():
-            df.save(TaskMonitor.DUMMY)
-        else:
-            self._project.saveAs(self._program, "/", self._program.getName(), True)
+        # The program is opened with GhidraProject.openProgram(), which starts a
+        # "Batch Processing" transaction and records its id in
+        # GhidraProject.openPrograms.  DomainFile.save() cannot lock while that
+        # transaction is open -- it fails with
+        # "java.io.IOException: Unable to lock due to active transaction" -- and
+        # the transaction is not reachable through TransactionInfo: startTransaction()
+        # returns the transaction's *entry* id (the value endTransaction() takes),
+        # while TransactionInfo.getID() is the underlying DB-transaction id, so
+        # _end_open_transactions() ended nothing and the entry stayed open.
+        # GhidraProject.save() is the supported path for a program opened through
+        # GhidraProject: it ends the stored transaction, saves the domain file, and
+        # re-opens an empty transaction.
+        self._project.save(self._program)
 
     def close(self, save: bool = True) -> dict:
         """Close the current database.
